@@ -44,6 +44,13 @@ namespace Stockfish::Eval::NNUE {
   std::string fileName;
   std::string netDescription;
 
+  constexpr int BUCKET_INDICES[32] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 1, 1, 2, 2, 2, 3,
+    3, 3, 4, 4, 4, 5, 5, 5,
+    6, 6, 6, 7, 7, 7, 7, 7,
+  };
+
   namespace Detail {
 
   // Initialize the evaluation function parameters
@@ -156,7 +163,7 @@ namespace Stockfish::Eval::NNUE {
 
     ASSERT_ALIGNED(transformedFeatures, alignment);
 
-    const int bucket = (pos.count<ALL_PIECES>() - 1) / 4;
+    const int bucket = BUCKET_INDICES[pos.count<ALL_PIECES>() - 1];
     const auto psqt = featureTransformer->transform(pos, transformedFeatures, bucket);
     const auto positional = network[bucket]->propagate(transformedFeatures);
 
@@ -194,7 +201,7 @@ namespace Stockfish::Eval::NNUE {
     ASSERT_ALIGNED(transformedFeatures, alignment);
 
     NnueEvalTrace t{};
-    t.correctBucket = (pos.count<ALL_PIECES>() - 1) / 4;
+    t.correctBucket = BUCKET_INDICES[pos.count<ALL_PIECES>() - 1];
     for (IndexType bucket = 0; bucket < LayerStacks; ++bucket) {
       const auto materialist = featureTransformer->transform(pos, transformedFeatures, bucket);
       const auto positional = network[bucket]->propagate(transformedFeatures);
