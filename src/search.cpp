@@ -1679,9 +1679,6 @@ Value Search::Worker::flip_search(
                             VALUE_MATE_IN_MAX_PLY - 1);
     };
 
-    // Basic reduction for flip search to account for its branching factor
-    depth = depth - 1;
-
     // 1. Get all existing pieces and their counts, as well as the total number of pieces
     auto restPieces = pos.rest_pieces(~pos.side_to_move());
     int total_num_branches = static_cast<int>(restPieces.size());
@@ -1751,7 +1748,7 @@ Value Search::Worker::flip_search(
         branch.value = VALUE_NONE;
         branch.alpha = init_value_estimate;
         branch.beta  = init_value_estimate + 1;
-        branch.delta = 30;
+        branch.delta = 5;
         branch.piece = piece;
         branch.bound = BOUND_NONE;
         branch.weighted_wr = score_to_winrate(init_value_estimate) * branch.prob;
@@ -1804,7 +1801,8 @@ Value Search::Worker::flip_search(
             num_branches_below_alpha++;
             branch.bound = BOUND_UPPER;
             branch.alpha = std::max(branch.value - branch.delta, -VALUE_INFINITE);
-            branch.beta  = std::min(branch.value + branch.delta, VALUE_INFINITE);
+            //branch.beta  = std::min(branch.value + branch.delta, branch.beta);
+            branch.beta = std::min((branch.value + branch.beta) / 2, branch.beta);
             branch.delta += branch.delta;
             double new_weighted_upperbound_wr = score_to_winrate(branch.alpha) * branch.prob;
             if (new_weighted_upperbound_wr < branch.weighted_upperbound_wr) {
@@ -1815,7 +1813,8 @@ Value Search::Worker::flip_search(
         } else if (branch.value >= branch.beta) {
             num_branches_above_beta++;
             branch.bound = BOUND_LOWER;
-            branch.alpha = std::max(branch.value - branch.delta, -VALUE_INFINITE);
+            //branch.alpha = std::max(branch.value - branch.delta, branch.alpha);
+            branch.alpha = std::max((branch.value + branch.alpha) / 2, branch.alpha);
             branch.beta  = std::min(branch.value + branch.delta, VALUE_INFINITE);
             branch.delta += branch.delta;
             double new_weighted_lowerbound_wr = score_to_winrate(branch.beta) * branch.prob;
@@ -1897,6 +1896,9 @@ Value Search::Worker::flip_search(
         //           << ", alpha_wr: " << alpha_wr
         //           << ", beta_wr: " << beta_wr
         //           << std::endl;
+
+        // Reduce the depth after each iteration
+        depth = std::max(0, depth - 1);
     }
 
     // 9. Check if we can return a deterministic mate value
