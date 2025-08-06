@@ -1670,14 +1670,17 @@ template<NodeType nodeType, bool isQsearch>
 Value Search::Worker::flip_search(
     Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode) {
     constexpr double scaling          = 475.51666;
-    constexpr auto   score_to_winrate = [&](Value v) { return 1.0 / (1.0 + exp(-v / scaling)); };
-    constexpr auto   winrate_to_score = [&](double winrate) {
+    constexpr auto   score_to_winrate = [](Value v) { return 1.0 / (1.0 + exp(-v / scaling)); };
+    constexpr auto   winrate_to_score = [](double winrate) {
         constexpr double epsilon = 1e-9;
         winrate                  = std::clamp(winrate, epsilon, 1.0 - epsilon);
         double q                 = log(winrate / (1.0 - winrate));
         return std::clamp(static_cast<Value>(q * scaling), VALUE_MATED_IN_MAX_PLY + 1,
                             VALUE_MATE_IN_MAX_PLY - 1);
     };
+
+    // Basic reduction for flip search to account for its branching factor
+    depth = depth - 1;
 
     // 1. Get all existing pieces and their counts, as well as the total number of pieces
     auto restPieces = pos.rest_pieces(~pos.side_to_move());
@@ -1689,36 +1692,31 @@ Value Search::Worker::flip_search(
     
     // 2. Get initial bound estimates for all branches
     struct DarkBranchInfo {
-        double prob, weighted_wr;
+        double prob, weighted_wr, weighted_lowerbound_wr, weighted_upperbound_wr;
         Value value, alpha, beta;
         int delta;
         Piece piece;
-        DarkBranchInfo(Piece piece, double prob, Value init_value_estimate)
-            : prob(prob), weighted_wr(0.0), value(VALUE_NONE), alpha(init_value_estimate), beta(init_value_estimate + 1), delta(10), piece(piece) {}
-        bool is_unexplored() const { return value == VALUE_NONE; }
-        bool is_decisive() const { return abs(value) >= VALUE_MATE_IN_MAX_PLY; }
-        bool is_known_exact() const { return value >= alpha && value < beta; }
-        bool is_below_alpha() const { return value < alpha; }
-        bool is_above_beta() const { return value >= beta; }
+        Bound bound;
     };
     std::vector<DarkBranchInfo> branches;
-    branches.reserve(restPieces.size());
-    double remaining_weighted_alpha_wr = 0.0;
-    double remaining_weighted_beta_wr  = 0.0;
-    const Key posKey = pos.key();
-    const auto correctionValue = correction_value(*this, pos, ss);
+    branches.resize(restPieces.size());
     const double inv_total_num_pieces = 1.0 / total_num_pieces;
     DirtyPiece dp = accumulatorStack.latest().dirtyPiece;
-    for (auto [piece, num] : restPieces) {
+    for (size_t i = 0; i < restPieces.size(); ++i) {
+        auto [piece, num] = restPieces[i];
+
         accumulatorStack.pop();
         Piece flipped_piece = pos.do_flip((ss - 1)->currentMove.to_sq(), piece, &dp, &tt);
         accumulatorStack.push(dp);
 
         // Update inCheck status
         ss->inCheck = bool(pos.checkers());
-        
+        // std::cout << "Flipped piece: " << int(flipped_piece) << ", fen: " << pos.fen() << ", ss->inCheck: " << int(ss->inCheck) << std::endl;
+
         Value init_value_estimate = alpha;
         if (!ss->inCheck) {
+            const Key posKey = pos.key();
+            const auto correctionValue = correction_value(*this, pos, ss);
             auto [ttHit, ttData, ttWriter] = tt.probe(posKey);
             if (ttHit) {
                 ttData.value = value_from_tt(ttData.value, ss->ply, pos.rule40_count());
@@ -1743,100 +1741,126 @@ Value Search::Worker::flip_search(
                 ttWriter.write(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_UNSEARCHED, Move::none(),
                             unadjustedStaticEval, tt.generation());
             }
+            // std::cout << "ttHit!, init_value_estimate: " << init_value_estimate << std::endl;
         }
 
         pos.undo_flip((ss - 1)->currentMove.to_sq(), flipped_piece);
 
-        branches.emplace_back(piece, num * inv_total_num_pieces, init_value_estimate);
-        const auto& branch = branches.back();
-        remaining_weighted_alpha_wr += score_to_winrate(branch.alpha) * branch.prob;
-        remaining_weighted_beta_wr += score_to_winrate(branch.beta) * branch.prob;
+        auto& branch = branches[i];
+        branch.prob = static_cast<double>(num) * inv_total_num_pieces;
+        branch.value = VALUE_NONE;
+        branch.alpha = init_value_estimate;
+        branch.beta  = init_value_estimate + 1;
+        branch.delta = 30;
+        branch.piece = piece;
+        branch.bound = BOUND_NONE;
+        branch.weighted_wr = score_to_winrate(init_value_estimate) * branch.prob;
+        branch.weighted_lowerbound_wr = 0.0 * branch.prob;
+        branch.weighted_upperbound_wr = 1.0 * branch.prob;
+
+        // std::cout << "Branch Init: " << int(piece) << ", prob: " << branch.prob
+        //           << ", alpha: " << branch.alpha << ", beta: " << branch.beta
+        //           << ", init_value_estimate: " << init_value_estimate 
+        //           << std::endl;
     }
 
-    // 3. initialize the bound winrates and loop accumulators
+    // 3. Sort branches by their probability and weighted winrate in descending order.
+    std::stable_sort(branches.begin(), branches.end(), [](const DarkBranchInfo& a, const DarkBranchInfo& b) { return a.prob > b.prob; });
+
+    // 4. initialize the bound winrates and loop accumulators
     // ----|---------------|----------------|---------------|-----
     //   LOSE            ALPHA            BETA           WINNING
-    //           |                 |             |----------------> num_branches_above_beta
-    //           |                 |------------------------------> num_branches_known_exact
-    //           |------------------------------------------------> num_branched_below_alpha 
-    double alpha_wr = score_to_winrate(alpha);
-    double beta_wr  = score_to_winrate(beta);
+    //           |                 |             |----------------> BOUND_LOWER: num_branches_above_beta
+    //           |                 |------------------------------> BOUND_EXACT: num_branches_known_exact
+    //           |------------------------------------------------> BOUND_UPPER: num_branches_below_alpha
+    const double alpha_wr = score_to_winrate(alpha);
+    const double beta_wr  = score_to_winrate(beta);
     int num_branches_below_alpha = 0;
     int num_branches_known_exact = 0;
     int num_branches_above_beta = 0;
-    int num_branches_decisive = 0;
-    double accumulated_weighted_wr = 0.0;
-    double next_remaining_weight_alpha_wr = 0.0;
-    double next_remaining_weight_beta_wr  = 0.0;
+    double accumulated_weighted_lowerbound_wr = 0.0;
+    double accumulated_weighted_upperbound_wr = 1.0;
     auto searchDarkBranch = [&](DarkBranchInfo& branch) {
         // Ensure we are not searching a branch that has known exact winrate
-        assert(branch.is_unexplored() || !(branch.is_known_exact() || branch.is_decisive()));
+        assert(branch.bound != BOUND_EXACT);
 
         // Get the new search value for this branch
         Value newValue;
-        if constexpr (isQsearch)
+        if (isQsearch || depth <= 0)
             newValue = qsearch<nodeType>(pos, ss, branch.alpha, branch.beta);
         else
             newValue = search<nodeType>(pos, ss, branch.alpha, branch.beta, depth, cutNode);
         
         // Update the branch statistics
-        if (!branch.is_unexplored()) {
-            if (branch.is_below_alpha())
-                num_branches_below_alpha--;
-            else if (branch.is_above_beta())
-                num_branches_above_beta--;
-        }
+        if (branch.bound & BOUND_UPPER)
+            num_branches_below_alpha--;
+        else if (branch.bound & BOUND_LOWER)
+            num_branches_above_beta--;
+
         branch.value = newValue;
         branch.weighted_wr = score_to_winrate(branch.value) * branch.prob;
-        accumulated_weighted_wr += branch.weighted_wr;
-        if (branch.is_decisive()) {
-            num_branches_decisive++;
-            next_remaining_weight_alpha_wr += branch.weighted_wr;
-            next_remaining_weight_beta_wr  += branch.weighted_wr;
-        }
-        else if (branch.is_below_alpha()) {
+
+        if (branch.value < branch.alpha) {
             num_branches_below_alpha++;
-            branch.alpha = std::max(branch.value - branch.delta, VALUE_MATED_IN_MAX_PLY);
-            next_remaining_weight_alpha_wr += score_to_winrate(branch.alpha) * branch.prob;
-            next_remaining_weight_beta_wr  += score_to_winrate(branch.beta)  * branch.prob;
-            branch.delta += branch.delta / 3;
-        }
-        else if (branch.is_above_beta()) {
-            branch.beta = std::min(branch.value + branch.delta, VALUE_MATE_IN_MAX_PLY);
+            branch.bound = BOUND_UPPER;
+            branch.alpha = std::max(branch.value - branch.delta, -VALUE_INFINITE);
+            branch.beta  = std::min(branch.value + branch.delta, VALUE_INFINITE);
+            branch.delta += branch.delta;
+            double new_weighted_upperbound_wr = score_to_winrate(branch.alpha) * branch.prob;
+            if (new_weighted_upperbound_wr < branch.weighted_upperbound_wr) {
+                accumulated_weighted_upperbound_wr -= branch.weighted_upperbound_wr;
+                branch.weighted_upperbound_wr = new_weighted_upperbound_wr;
+                accumulated_weighted_upperbound_wr += branch.weighted_upperbound_wr;
+            }
+        } else if (branch.value >= branch.beta) {
             num_branches_above_beta++;
-            next_remaining_weight_alpha_wr += score_to_winrate(branch.alpha) * branch.prob;
-            next_remaining_weight_beta_wr  += score_to_winrate(branch.beta)  * branch.prob;
-            branch.delta += branch.delta / 3;
-        }
-        else {
+            branch.bound = BOUND_LOWER;
+            branch.alpha = std::max(branch.value - branch.delta, -VALUE_INFINITE);
+            branch.beta  = std::min(branch.value + branch.delta, VALUE_INFINITE);
+            branch.delta += branch.delta;
+            double new_weighted_lowerbound_wr = score_to_winrate(branch.beta) * branch.prob;
+            if (new_weighted_lowerbound_wr > branch.weighted_lowerbound_wr) {
+                accumulated_weighted_lowerbound_wr -= branch.weighted_lowerbound_wr;
+                branch.weighted_lowerbound_wr = new_weighted_lowerbound_wr;
+                accumulated_weighted_lowerbound_wr += branch.weighted_lowerbound_wr;
+            }
+        } else {
             num_branches_known_exact++;
-            next_remaining_weight_alpha_wr += branch.weighted_wr;
-            next_remaining_weight_beta_wr  += branch.weighted_wr;
+            branch.bound = BOUND_EXACT;
+            accumulated_weighted_lowerbound_wr -= branch.weighted_lowerbound_wr;
+            accumulated_weighted_upperbound_wr -= branch.weighted_upperbound_wr;
+            branch.weighted_lowerbound_wr = branch.weighted_wr;
+            branch.weighted_upperbound_wr = branch.weighted_wr;
+            accumulated_weighted_lowerbound_wr += branch.weighted_lowerbound_wr;
+            accumulated_weighted_upperbound_wr += branch.weighted_upperbound_wr;
         }
     };
     
-    // 4. Loop until winrates of all branches are known exactly or we have a decisive cut.
-    while (num_branches_known_exact + num_branches_decisive < total_num_branches) {
+    // 5. Loop until winrates of all branches are known exactly or we have a decisive cut.
+    while (num_branches_known_exact < total_num_branches) {
 
-        // 5. Get results of each chance branch and update bound and accumulators
+        // std::cout << "total_num_branches: " << total_num_branches
+        //           << ", num_branches_known_exact: " << num_branches_known_exact
+        //           << ", num_branches_below_alpha: " << num_branches_below_alpha
+        //           << ", num_branches_above_beta: " << num_branches_above_beta
+        //           << ", accumulated_weighted_lowerbound_wr: " << accumulated_weighted_lowerbound_wr
+        //           << ", accumulated_weighted_upperbound_wr: " << accumulated_weighted_upperbound_wr
+        //           << ", alpha_wr: " << alpha_wr
+        //           << ", beta_wr: " << beta_wr
+        //           << std::endl;
+
+        // 6. Get results of each chance branch and update bound and accumulators
         for (auto& branch : branches) {
             // If we already know the exact winrate of this branch, skip searching it.
-            if (branch.is_known_exact() || branch.is_decisive()) {
-                accumulated_weighted_wr += branch.weighted_wr;
-                next_remaining_weight_alpha_wr += branch.weighted_wr;
-                next_remaining_weight_beta_wr  += branch.weighted_wr;
+            if (branch.bound == BOUND_EXACT)
                 continue;
-            }
 
-            // 6. Calculate a dynamic bound for this branch
-            // If search result falls outside this bound and all other branches are decisive,
-            // we can determine a decisive cut for this chance node.
-            //double branch_alpha_wr = (alpha_wr - accumulated_weighted_wr - remaining_weighted_beta_wr) / branch.prob;
-            //double branch_beta_wr = (beta_wr - accumulated_weighted_wr - remaining_weighted_alpha_wr) / branch.prob;
-            //branch_alpha_wr = std::max(branch_alpha_wr, 0.0);
-            //branch_beta_wr = std::min(branch_beta_wr, 1.0);
-            //branch.alpha = std::min(branch.alpha, winrate_to_score(branch_alpha_wr));
-            //branch.beta = std::max(branch.beta, winrate_to_score(branch_beta_wr));
+            // std::cout << "Branch BeforeSearch: " << int(branch.piece) << ", prob: " << branch.prob
+            //           << ", alpha: " << branch.alpha << ", beta: " << branch.beta
+            //           << ", value: " << branch.value
+            //           << ", weighted_alpha_wr: " << branch.weighted_alpha_wr
+            //           << ", weighted_beta_wr: " << branch.weighted_beta_wr
+            //           << std::endl;
 
             // 7. Search the branch
             {
@@ -1848,28 +1872,34 @@ Value Search::Worker::flip_search(
 
                 pos.undo_flip((ss - 1)->currentMove.to_sq(), flipped_piece);
             }
+
+            // std::cout << "Branch AfterSearch: " << int(branch.piece) << ", prob: " << branch.prob
+            //           << ", value: " << branch.value << ", alpha: " << branch.alpha << ", beta: " << branch.beta
+            //           << ", weighted_wr: " << branch.weighted_wr << ", weighted_alpha_wr: " << branch.weighted_alpha_wr << ", weighted_beta_wr: " << branch.weighted_beta_wr
+            //           << std::endl;
             
             // 8. Check for early pruning
             // If all branches are known to have winrates that can sum above beta, we can do beta cut.
-            if (num_branches_known_exact + num_branches_decisive + num_branches_above_beta == total_num_branches
-                && accumulated_weighted_wr + remaining_weighted_alpha_wr >= beta_wr)
-                return winrate_to_score(accumulated_weighted_wr + remaining_weighted_alpha_wr);
-            
+            if (accumulated_weighted_lowerbound_wr >= beta_wr)
+                return winrate_to_score(accumulated_weighted_lowerbound_wr);
+
             // If all branches are known to have winrates that can sum below alpha, we can do alpha cut.
-            if (num_branches_known_exact + num_branches_decisive + num_branches_below_alpha == total_num_branches
-                && accumulated_weighted_wr + remaining_weighted_beta_wr <= alpha_wr)
-                return winrate_to_score(accumulated_weighted_wr + remaining_weighted_beta_wr);
+            if (accumulated_weighted_upperbound_wr < alpha_wr)
+                return winrate_to_score(accumulated_weighted_upperbound_wr);
         }
 
-        // 9. Reset accumulators for the next iteration
-        remaining_weighted_alpha_wr = next_remaining_weight_alpha_wr;
-        remaining_weighted_beta_wr  = next_remaining_weight_beta_wr;
-        accumulated_weighted_wr = 0.0;
-        next_remaining_weight_alpha_wr = 0.0;
-        next_remaining_weight_beta_wr  = 0.0;
+        // std::cout << "After all branch search: "
+        //           << ", num_branches_known_exact: " << num_branches_known_exact
+        //           << ", num_branches_below_alpha: " << num_branches_below_alpha
+        //           << ", num_branches_above_beta: " << num_branches_above_beta
+        //           << ", accumulated_weighted_lowerbound_wr: " << accumulated_weighted_lowerbound_wr
+        //           << ", accumulated_weighted_upperbound_wr: " << accumulated_weighted_upperbound_wr
+        //           << ", alpha_wr: " << alpha_wr
+        //           << ", beta_wr: " << beta_wr
+        //           << std::endl;
     }
 
-    // 10. Check if we can return a deterministic mate value
+    // 9. Check if we can return a deterministic mate value
     bool all_decisive = true;
     for (const auto& branch : branches) {
         if (!is_decisive(branch.value)) {
@@ -1899,7 +1929,7 @@ Value Search::Worker::flip_search(
             return best_loss_mate;
     }
 
-    // 11. If not, we return the expected winrate of all branches
+    // 10. If not, we return the expected winrate of all branches
     double expected_winrate = 0.0;
     for (const auto& branch : branches)
         expected_winrate += branch.weighted_wr;
