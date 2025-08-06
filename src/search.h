@@ -281,12 +281,11 @@ class Worker {
     Value qsearch(Position& pos, Stack* ss, Value alpha, Value beta);
 
     // This is the flip search function for any nodes
-    template<NodeType nodeType>
+    template<NodeType nodeType, bool isQsearch>
     Value flip_search(Position&              pos,
                       Stack*                 ss,
                       Value                  alpha,
                       Value                  beta,
-                      bool                   isQsearch = true,
                       [[maybe_unused]] Depth depth     = -1,
                       [[maybe_unused]] bool  cutNode   = false);
 
