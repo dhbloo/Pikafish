@@ -1747,7 +1747,7 @@ Value Search::Worker::flip_search(
         branch.alpha = alpha;
         branch.beta  = beta;
         branch.delta = std::min(beta - alpha, 10);
-        branch.error_margin = 100;
+        branch.error_margin = (int)std::min(50 / branch.prob, 1000.0);
         branch.piece = piece;
         branch.bound = BOUND_NONE;
         branch.weighted_wr = 0.0;
